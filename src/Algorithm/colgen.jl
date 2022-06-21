@@ -80,6 +80,7 @@ Here are their meanings :
     smoothing_stabilization::Float64 = 0.0 # should be in [0, 1]
     opt_atol::Float64 = Coluna.DEF_OPTIMALITY_ATOL
     opt_rtol::Float64 = Coluna.DEF_OPTIMALITY_RTOL
+    max_time::Float64 = 300.0
 end
 
 stabilization_is_used(algo::ColumnGeneration) = !iszero(algo.smoothing_stabilization)
@@ -838,6 +839,11 @@ function cg_main_loop!(
         if iteration > algo.max_nb_iterations
             setterminationstatus!(cg_optstate, OTHER_LIMIT)
             @warn "Maximum number of column generation iteration is reached."
+            return true, false
+        end
+        if elapsed_optim_time(env) > algo.max_time
+            setterminationstatus!(cg_optstate, OTHER_LIMIT)
+            @warn "Maximum time is reached."
             return true, false
         end
         essential_cuts_separated = false

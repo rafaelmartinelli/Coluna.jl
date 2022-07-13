@@ -1,7 +1,5 @@
 mutable struct Formulation{Duty <: AbstractFormDuty}  <: AbstractFormulation
     uid::Int
-    var_counter::Int
-    constr_counter::Int
     parent_formulation::Union{AbstractFormulation, Nothing} # master for sp, reformulation for master
     optimizers::Vector{AbstractOptimizer}
     manager::FormulationManager
@@ -9,6 +7,7 @@ mutable struct Formulation{Duty <: AbstractFormDuty}  <: AbstractFormulation
     buffer::FormulationBuffer
     storage::Storage
     duty_data::Duty
+    env::Env{VarId}
 end
 
 """
@@ -28,7 +27,7 @@ reformulation for a master, `nothing` by default), and `obj_sense` the sense of 
 function (`MinSense` or `MaxSense`).
 """
 function create_formulation!(
-    env,
+    env::Env{VarId},
     duty::AbstractFormDuty;
     parent_formulation = nothing,
     obj_sense::Type{<:Coluna.AbstractSense} = MinSense
@@ -38,9 +37,9 @@ function create_formulation!(
     end
     buffer = FormulationBuffer{VarId,Variable,ConstrId,Constraint}()
     return Formulation(
-        env.form_counter += 1, 0, 0, parent_formulation, AbstractOptimizer[], 
+        env.form_counter += 1, parent_formulation, AbstractOptimizer[], 
         FormulationManager(buffer, custom_families_id = env.custom_families_id), obj_sense,
-        buffer, Storage(), duty
+        buffer, Storage(), duty, env
     )
 end
 
@@ -177,7 +176,7 @@ function setvar!(
     # Custom representation of the variable (advanced use).
     custom_data::Union{Nothing, BD.AbstractCustomData} = nothing,
     # Default id of the variable.
-    id = VarId(duty, form.var_counter += 1, getuid(form)),
+    id = VarId(duty, form.env.var_counter += 1, getuid(form)),
     # The formulation from which the variable is generated.
     origin::Union{Nothing,Formulation} = nothing,
     # By default, the name of the variable is `name`. However, when you do column
@@ -186,6 +185,7 @@ function setvar!(
     # the variable will be `name_uid`.
     id_as_name_suffix = false,
 )
+    # TODO: we should have a dedicated procedure for preprocessing.
     if kind == Binary
         lb = lb < 0.0 ? 0.0 : lb
         ub = ub > 1.0 ? 1.0 : ub
@@ -240,7 +240,8 @@ end
 # Methods specific to a Formulation with DwSp duty
 ############################################################################################
 
-getprimalsolpool(form::Formulation{DwSp}) = form.duty_data.primalsols_pool
+get_primal_sol_pool(form::Formulation{DwSp}) = form.duty_data.primalsols_pool
+get_primal_sol_pool_hash_table(form::Formulation{DwSp}) = form.duty_data.hashtable_primalsols_pool
 
 ############################################################################################
 # Pool of solutions
@@ -249,14 +250,13 @@ getprimalsolpool(form::Formulation{DwSp}) = form.duty_data.primalsols_pool
 
 # Returns nothing if there is no identical solutions in pool; the id of the
 # identical solution otherwise.
-function _get_same_sol_in_pool(pool_sols, pool_costs, sol, sol_cost)
-    for (existing_sol_id, existing_sol_cost) in pool_costs
-        if isapprox(existing_sol_cost, sol_cost)
-            # TODO: implement comparison between view & dynamicsparsevec
-            existing_sol = pool_sols[existing_sol_id,:]
-            if existing_sol == sol
-                return existing_sol_id
-            end
+function _get_same_sol_in_pool(pool_sols, pool_hashtable, sol)
+    sols_with_same_members = getsolids(pool_hashtable, sol)
+    for existing_sol_id in sols_with_same_members
+        # TODO: implement comparison between view & dynamicsparsevec
+        existing_sol = pool_sols[existing_sol_id,:]
+        if existing_sol == sol
+            return existing_sol_id
         end
     end
     return nothing
@@ -312,14 +312,9 @@ subproblem; `nothing` otherwise.
 """
 function get_column_from_pool(primal_sol::PrimalSolution{Formulation{DwSp}})
     spform = primal_sol.solution.model
-    new_col_peren_cost = mapreduce(
-        ((var_id, var_val),) -> getperencost(spform, var_id) * var_val,
-        +,
-        primal_sol
-    )
-    pool = getprimalsolpool(spform)
-    costs_pool = spform.duty_data.costs_primalsols_pool
-    return _get_same_sol_in_pool(pool, costs_pool, primal_sol.solution.sol, new_col_peren_cost)
+    pool = get_primal_sol_pool(spform)
+    pool_hashtable = get_primal_sol_pool_hash_table(spform)
+    return _get_same_sol_in_pool(pool, pool_hashtable, primal_sol.solution.sol)
 end
 
 """
@@ -350,7 +345,8 @@ function insert_column!(
         primal_sol
     )
 
-    pool = getprimalsolpool(spform)
+    pool = get_primal_sol_pool(spform)
+    pool_hashtable = get_primal_sol_pool_hash_table(spform)
     costs_pool = spform.duty_data.costs_primalsols_pool
     custom_pool = spform.duty_data.custom_primalsols_pool
 
@@ -384,6 +380,7 @@ function insert_column!(
         if primal_sol.custom_data !== nothing
             custom_pool[col_id] = primal_sol.custom_data
         end
+        savesolid!(pool_hashtable, col_id, primal_sol)
     end
     return getid(col)
 end
@@ -444,7 +441,7 @@ function setdualsol!(form::Formulation, new_dual_sol::DualSolution)::Tuple{Bool,
     end
 
     ### else not identical to any existing dual sol
-    new_dual_sol_id = ConstrId(BendSpDualSol, form.constr_counter += 1, getuid(form))
+    new_dual_sol_id = ConstrId(BendSpDualSol, form.env.constr_counter += 1, getuid(form))
     _adddualsol!(form, new_dual_sol, new_dual_sol_id)
     return (true, new_dual_sol_id)
 end
@@ -556,7 +553,7 @@ function setconstr!(
     members = nothing, # todo Union{AbstractDict{VarId,Float64},Nothing}
     loc_art_var_abs_cost::Float64 = 0.0,
     custom_data::Union{Nothing, BD.AbstractCustomData} = nothing,
-    id = ConstrId(duty, form.constr_counter += 1, getuid(form))
+    id = ConstrId(duty, form.env.constr_counter += 1, getuid(form))
 )
     if getduty(id) != duty
         id = ConstrId(id, duty = duty)
@@ -687,7 +684,7 @@ function _setrobustmembers!(form::Formulation, constr::Constraint, members::VarM
             # then for all columns having its own variables
             assigned_form_uid = getassignedformuid(varid)
             spform = get_dw_pricing_sps(form.parent_formulation)[assigned_form_uid]
-            for (col_id, col_coeff) in @view getprimalsolpool(spform)[:,varid]
+            for (col_id, col_coeff) in @view get_primal_sol_pool(spform)[:,varid]
                 coef_matrix[constrid, col_id] += col_coeff * var_coeff
             end
         end

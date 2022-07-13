@@ -52,7 +52,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
 
     function Optimizer()
         model = new()
-        model.env = Env(Params())
+        model.env = Env{VarId}(Params())
         model.inner = Problem(model.env)
         model.is_objective_set = false
         model.objective_type = ZERO
@@ -1049,7 +1049,7 @@ function BD.value(info::ColumnInfo, index::MOI.VariableIndex)
     varid = info.optimizer.env.varids[index]
     origin_form_uid = getoriginformuid(info.column_var_id)
     spform = get_dw_pricing_sps(info.optimizer.inner.re_formulation)[origin_form_uid]
-    return getprimalsolpool(spform)[info.column_var_id,varid]
+    return get_primal_sol_pool(spform)[info.column_var_id,varid]
 end
 
 function MOI.get(model::Optimizer, ::MOI.NumberOfVariables)
